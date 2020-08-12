@@ -1,0 +1,4 @@
+#!/bin/sh
+
+cd /usr/local/bin/python-lb2120-tools.pipenvpkg && pipenv --rm
+echo "Removed python virtual env"

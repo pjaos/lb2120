@@ -1,0 +1,36 @@
+<PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto">
+
+    <PreferenceCategory app:title="@string/tone_header">
+
+        <SwitchPreference
+            android:id="@+id/defaultToneOn"
+            android:defaultValue="false"
+            android:key="@string/default_tone_on"
+            android:title="Default Tone On" />
+
+        <EditTextPreference
+            android:id="@+id/defaultToneHz"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:defaultValue="750"
+            android:digits="0123456789"
+            android:inputType="numberDecimal"
+            android:key="@string/default_tone_hz"
+            android:title="Default Tone (Hz)"
+            app:useSimpleSummaryProvider="true" />
+
+        <EditTextPreference
+            android:id="@+id/tone_step_hz"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:defaultValue="25"
+            android:digits="0123456789"
+            android:inputType="numberDecimal"
+            android:key="@string/tone_step_hz"
+            android:title="Tone Step (Hz)"
+            app:useSimpleSummaryProvider="true" />
+
+    </PreferenceCategory>
+
+</PreferenceScreen>

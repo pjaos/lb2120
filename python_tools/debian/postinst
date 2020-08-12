@@ -1,0 +1,6 @@
+#!/bin/sh
+
+echo "**************************************************************"
+echo "*               Netgear LB2120 Antenna Aligner               *"
+echo "*   The lb2120 and lb2120_mbps commands are now available    *"
+echo "**************************************************************"
