@@ -166,15 +166,14 @@ This tool was useful in setting up the antenna for the 4G broadband connection. 
 
 
 # Netgear LB2120 throughput logging tool
-This is a software tool (installed with the lb2120 too above) that allows the 
+This is a software tool (installed with the lb2120 tool above) that allows the 
 user to record the throughput (TX and RX) rates from a Netgear LB2120 router. 
 I developed this tool when adding a 4G broadband connection to my house in 
 order to record the details of my internet usage.
 
 ## Overview
-This is a python program that logs into the web interface of the LB2120 
-4G modem and reads the TX/RX rates and temperature of the modem. 
-This data is recorded to a mysql database.
+This is a python program that 'scrapes' data from the web interface of a LB2120 
+4G modem (TX/RX rates and temperature) and records this data to a mysql database.
 
 ## Running the tool
 
@@ -222,7 +221,6 @@ INFO:  SAMPLE TIME:   2020-08-12 20:06:00.931226
 INFO:  LB2120_STATS TABLE: Added count: 2
 ```
 
-This will cause instance of google-chrome to start (which must be installed)
-and login to the LB2120 web interface and retrieving data to save to the database.
-The 'Connecting to 192.168.1.200:3306 (database = 4G_USAGE)' line above is the connection to the database.
+This will cause instance of google-chrome to start (which must be installed previously)
+The tool will then login to the LB2120 web interface and start retrieving data to save to the database as shown above.
 
