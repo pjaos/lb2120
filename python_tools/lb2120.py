@@ -1,21 +1,118 @@
 #!/usr/bin/env python3.8
 
 import  os
-import  socket
-import  platform
 import  json
-import  struct
+import  datetime
+import  traceback
+
+from    plotly.subplots import make_subplots
+import  plotly.graph_objects as go
+
+from    queue import Queue
 from    time import time, sleep
-from    optparse import OptionParser, TitledHelpFormatter, IndentedHelpFormatter
-from    threading import Thread, Lock
+from    optparse import OptionParser
 from    webbot import Browser
-from    bs4 import BeautifulSoup
+from    threading import Thread
 
+from    open_source_libs.p3lib.pconfig import ConfigManager
+from    open_source_libs.p3lib.database_if import DBConfig, DatabaseIF
 from    open_source_libs.p3lib.uio import UIO
-from    open_source_libs.p3lib.pconfig import ConfigManager 
-from    open_source_libs.p3lib.boot_manager import BootManager
-from    open_source_libs.p3lib.netif import NetIF
 
+class DBClientConfig(ConfigManager):
+    """@brief Responsible for managing the database configuration."""
+    
+    CFG_FILENAME            = "4g_usage_db_config.cfg"
+
+    DB_HOST                 = "DB_HOST"
+    DB_PORT                 = "DB_PORT"
+    DB_USERNAME             = "DB_USERNAME"
+    DB_PASSWORD             = "DB_PASSWORD"
+    DB_NAME                 = "DB_NAME"
+    DB_TABLE_SCHEMA         = "DB_TABLE_SCHEMA"
+
+    DEFAULT_CONFIG = {
+        DB_HOST:                    "127.0.0.1",
+        DB_PORT:                    3306,
+        DB_USERNAME:                "",
+        DB_PASSWORD:                "",
+        DB_NAME:                    "",
+        DB_TABLE_SCHEMA:            ""
+    }
+
+    def __init__(self, uio, configFile):
+        """@brief Constructor.
+           @param uio UIO instance.
+           @param configFile Config file instance."""
+        super().__init__(uio, configFile, DBClientConfig.DEFAULT_CONFIG, addDotToFilename=False, encrypt=True)
+        self._uio     = uio
+        self.load()
+
+    def configure(self):
+        """@brief configure the required parameters for normal operation."""
+
+        self.inputStr(DBClientConfig.DB_HOST, "Enter the address of the MYSQL database server", False)
+
+        self.inputDecInt(DBClientConfig.DB_PORT, "Enter TCP port to connect to the MYSQL database server", minValue=1024, maxValue=65535)
+
+        self.inputStr(DBClientConfig.DB_USERNAME, "Enter the database username", False)
+
+        self.inputStr(DBClientConfig.DB_PASSWORD, "Enter the database password", False)
+
+        self.inputStr(DBClientConfig.DB_NAME, "Enter the database name to store the data into", False)
+
+        self._uio.info("Example table schema")
+        self._uio.info("TIMESTAMP:TIMESTAMP DOWNMBPS:FLOAT(24) UPMBPS:FLOAT(24) TEMPC:FLOAT(24) TEMPCRITICAL:VARCHAR(8)")
+        self.inputStr(DBClientConfig.DB_TABLE_SCHEMA, "Enter the database table schema", False)
+        #Check the validity of the schema
+        tableSchemaString = self.getAttr(DBClientConfig.DB_TABLE_SCHEMA)
+        UsageLogger.GetTableSchema(tableSchemaString)
+        self._uio.info("Table schema string OK")
+
+        self.store()
+        
+class ReadDBConfig(ConfigManager):
+    """@brief Responsible for managing the configuration used when reading values from the database."""
+    
+    CFG_FILENAME            = "read_4g_usage.cfg"
+
+    START_TIMESTAMP         = "START_TIMESTAMP"
+    DAYS                    = "DAYS"
+    STRIDE                  = "STRIDE"
+
+    DEFAULT_CONFIG = {
+        START_TIMESTAMP: "",
+        DAYS:            "",
+        STRIDE:          ""
+    }
+
+    def __init__(self, uio, configFile):
+        """@brief Constructor.
+           @param uio UIO instance.
+           @param configFile Config file instance."""
+        super().__init__(uio, configFile, ReadDBConfig.DEFAULT_CONFIG, addDotToFilename=False, encrypt=True)
+        self._uio     = uio
+        self.load()
+
+    def configure(self):
+        """@brief configure the required parameters for normal operation."""
+
+        self.inputStr(ReadDBConfig.START_TIMESTAMP, "Enter the start date and time in the format 2020/aug/10 15:30:15", False)
+
+        self.inputDecInt(ReadDBConfig.DAYS, "Enter the number days data to read", False)
+        
+        self.inputDecInt(ReadDBConfig.STRIDE, "Every n'th record to read (1 = every record, 2 = every other record, etc)")
+
+        self.store()
+
+class LB2120Stats(object):
+    """@brief Responsible for holding the LB2120 parameters that we are interested in."""
+    def __init__(self):
+        self.sampleTime   = None
+        self.downMbps     = None
+        self.upMbps       = None
+        self.tempC        = None
+        self.tempCrticial = None
+        
 class LB2120(Thread):
     """@brief Responsibile for connecting to the Netgear LB2120 4G modem and
               reading stats from it.
@@ -24,22 +121,22 @@ class LB2120(Thread):
 
     DEFAULT_ADDRESS     = "192.168.5.1"
     PASSWORD_ENV_VAR    = "NETGEAR_LB2120_PASSWORD"
-    POLL_DELAY_SECONDS  = 0.15
+    POLL_DELAY_SECONDS  = 10
 
-    def __init__(self, uio, options):
+    def __init__(self, uio, options, queue):
         """@brief Constructor
            @param uio A UIO instance for user input and output.
            @param options An instance of argparse options.
+           @param queue The queue to push LB2120Stats object into.
            """
         Thread.__init__(self)
         self._uio       = uio
         self._options   = options
-        
-        self._lock      = Lock()
-        self._rxp       = None
+        self._queue     = queue
+        self.running    = False
 
         self._password = os.environ.get(LB2120.PASSWORD_ENV_VAR)
-        if not self._password:
+        if not self._password and not self._options.total:
             uio.info("{} environmental variable undefined.".format(LB2120.PASSWORD_ENV_VAR))
             self._password = uio.getInput("Enter the password of the Netgear LB2120 4G router", noEcho=True)
 
@@ -53,285 +150,368 @@ class LB2120(Thread):
         web.click('Sign In')
         web.click(id='session_password')
         startTime = time()
-        while True:
-            web.go_to("http://{}/index.html#settings/network/status".format(self._options.address))
-            content = web.get_page_source()
-            now = time()
-            elapsedTime = now-startTime
-            startTime = now
-            self._pollSeconds = elapsedTime
+        lastDataRX = -1
+        lastDataTX = -1
+        self.running = True
+        while self.running:
+            try:
+                web.go_to("http://{}/api/model.json?internalapi=1&x=11228".format( self._options.address ))
+                content = web.get_page_source()
+                now = time()
+                elapsedTime = now-startTime
+                startTime = now
 
-            soup = BeautifulSoup(content, 'html.parser')
-            item = soup.body.find('dd', attrs={'class': 'm_wwan_signalStrength_rsrp'})
-            self._lock.acquire()
-            self._rxp= float(item.string)
-            self._uio.debug("4G RXP (dBm): {}".format(self._rxp))
-            self._lock.release()
-            sleep(LB2120.POLL_DELAY_SECONDS)
+                #Remove html text from the response
+                jsonContent=content.replace("<html xmlns=\"http://www.w3.org/1999/xhtml\"><head></head><body><pre style=\"word-wrap: break-word; white-space: pre-wrap;\">", "")
+                jsonContent=jsonContent.replace("</pre></body></html>", "")
+                
+                #Convert json text to a dict
+                data = json.loads(jsonContent)
+                            
+                #Grab the values associated with throughput
+                dataRX = int(data['wwan']['dataTransferredRx'])
+                dataTX = int(data['wwan']['dataTransferredTx'])
+                tempC  = float(data['general']['devTemperature'])
+                devTempCritical = data['power']['deviceTempCritical']
+                
+                if lastDataRX != -1:
+                    if dataRX < lastDataRX:
+                        print("<<<<<<<<<< dataRX: {} < {}".format(dataRX, lastDataRX))
+                    if dataTX < lastDataTX:
+                        print("<<<<<<<<<< dataTX: {} < {}".format(dataTX, lastDataTX))
 
-    def getRXP(self):
-        """@brief Get the RXP received by the modem.
-           @return The receive power in dBm."""
-        self._lock.acquire()
-        rxp = self._rxp
-        self._lock.release()
-        return rxp
+                    deltaDataRX = dataRX - lastDataRX
+                    deltaDataTX = dataTX - lastDataTX
+                    
+                    downLoadBps = (deltaDataRX/elapsedTime) * 8
+                    upLoadBps = (deltaDataTX/elapsedTime) * 8
+                    downLoadMBps = float(downLoadBps)/1E6
+                    upLoadMBps   = float(upLoadBps/1E6)
+                    
+                    lb2120Stats = LB2120Stats()
+                    lb2120Stats.downMbps = downLoadMBps
+                    lb2120Stats.upMbps = upLoadMBps
+                    lb2120Stats.tempC = tempC
+                    lb2120Stats.tempCrticial = devTempCritical
+                    lb2120Stats.sampleTime = datetime.datetime.now()
+                    
+                    self._queue.put(lb2120Stats)
+                    
+                #Save the last results for use next time around
+                lastDataRX = dataRX
+                lastDataTX = dataTX
+            
+            except:
+                lines = traceback.format_exc().split('\n')
+                for l in lines:
+                    self._uio.error(l)
+            
+            sleep(self._options.psec)
+            
+    def shutdown(self):
+        """@brief Stop the thread running"""
+        self.running = False
+    
+class UsageLogger(object):
+    """@brief Responsible reading and recording the usage of the 4G internet connection."""
+    
+    TIMESTAMP               = "TIMESTAMP"
+    TABLE_NAME              = "LB2120_STATS"
+    
+    @staticmethod
+    def GetTableSchema(tableSchemaString):
+        """@brief Get the table schema
+           @param tableSchemaString The string defining the database table schema.
+           @return A dictionary containing a database table schema."""
+        timestampFound=False
+        tableSchemaDict = {}
+        elems = tableSchemaString.split(" ")
+        if len(elems) > 0:
+            for elem in elems:
+                subElems = elem.split(":")
+                if len(subElems) == 2:
+                    colName = subElems[0]
+                    if colName == UsageLogger.TIMESTAMP:
+                        timestampFound=True
+                    colType = subElems[1]
+                    tableSchemaDict[colName] = colType
+                else:
+                    raise Exception("{} is an invalid table schema column.".format(elem))
+            return tableSchemaDict
+        else:
+            raise Exception("Invalid Table schema. No elements found.")
 
-class AYTListener(object):
-    """@brief Responsible listening for are you there messages (AYT) from the Android app and
-              sending responses back."""
-
-    IP_ADDRESS_KEY           = "IP_ADDRESS"
-    OS_KEY                   = "OS"
-    UDP_DEV_DISCOVERY_PORT   = 18912
-    UDP_RX_BUFFER_SIZE       = 2048
-    AYT_KEY                  = "AYT"
-    RXP                      = "RXP"
-    TCP_PORT_KEY             = "TCP_PORT"
-
-    def __init__(self, uo, options, deviceConfig):
+        if not timestampFound:
+            raise Exception("No {} table column defined.".format(UsageLogger.TIMESTAMP))
+            
+    def __init__(self, uo, options, config):
         """@Constructor
             @param uo A UserOutput instance.
-            @param options Command line options from OptionParser.
-            @param deviceConfig The device configuration instance."""
+            @param options Command line options from OptionParser."""
         self._uio=uo
         self._options=options
-        self._deviceConfig=deviceConfig
-        self._sock=None
+        self._config=config
+        self._queue = Queue()
+        self._dataBaseIF = None
+        self._addedCount = 0
+        self._tableSchema = None
 
-        self._osName = platform.system()
-        self._lb2120 = LB2120(self._uio, self._options)
-        self._aytReplySocket = None
-        self._rxIFName = None
+    def _shutdownDBSConnection(self):
+        """@brief Shutdown the connection to the DBS"""
+        if self._dataBaseIF:
+            self._dataBaseIF.disconnect()
+            self._dataBaseIF = None
+            
+    def _setupDBConfig(self):
+        """@brief Setup the internal DB config"""
+        self._dataBaseIF                    = None
+        self._dbConfig                      = DBConfig()
+        self._dbConfig.serverAddress        = self._config.getAttr(DBClientConfig.DB_HOST)
+        self._dbConfig.username             = self._config.getAttr(DBClientConfig.DB_USERNAME)
+        self._dbConfig.password             = self._config.getAttr(DBClientConfig.DB_PASSWORD)
+        self._dbConfig.dataBaseName         = self._config.getAttr(DBClientConfig.DB_NAME)
+        self._dbConfig.autoCreateTable      = True
+        self._dbConfig.uio                  = self._uio
+        self._dataBaseIF                    = DatabaseIF(self._dbConfig)
+        
+    def getTableSchema(self):
+        """@return the required MYSQL table schema"""
+        tableSchemaString = self._config.getAttr(DBClientConfig.DB_TABLE_SCHEMA)
+        return UsageLogger.GetTableSchema(tableSchemaString)
+        
+    def _connectToDBS(self):
+        """@brief connect to the database server."""
+        self._shutdownDBSConnection()
 
-    def _connectToServer(self, serverAddress, tcpPort):
-        """@brief Get a socket that is connected to the TCP server.
-           @param serverAddress The server address.
-           @param tcpPort The TCP socket to connect to on the server.
-           @return None"""
-        #If not connected then connecto to the server
-        if not self._aytReplySocket:
-            self._aytReplySocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self._aytReplySocket.connect((serverAddress, tcpPort))
+        self._setupDBConfig()
 
-    def _sendAYTReply(self, maxRetry=2):
-        """@brief Send a reply to the AYT messages (UDP broadcast) on the TCP socket to to the android app on a
-                  phone/tablet.
-           @param maxRetry The maximum number of sent retry attempts.
-           @return None"""
-        retryCount = 0
-        while True:
-            if retryCount >= maxRetry:
-                raise Exception("Failed to send AYT reply ({} retry limit reached).".format(maxRetry))
-            try:
-                #Build reply
-                jsonDict = {}
-                jsonDict[AYTListener.IP_ADDRESS_KEY] = self._netIF.getIFIPAddress(self._rxIFName)
-                jsonDict[AYTListener.OS_KEY] = self._osName
-                jsonDict[AYTListener.RXP] = "{}".format(self._lb2120.getRXP())
-                jsonDictStr = json.dumps(jsonDict)
+        self._dataBaseIF.connect()
+        self._uio.info("Connected to database")
 
-                self._uio.debug("%s: %s" % (self.__class__.__name__, jsonDictStr))
+        self._tableSchema = self.getTableSchema()
+        self._dataBaseIF.ensureTableExists(UsageLogger.TABLE_NAME, self._tableSchema, True)
+        
+    def _updateDatabase(self, lb2120Stats):
+        """@brief Update the database with the data received from the LB2120 web interface.
+           @param lb2120Stats A LB2120Stats instance"""
+            
+        if not self._dataBaseIF:
+            self._connectToDBS()
 
-                bytesToSend = jsonDictStr.encode()
-                bytesLen = len(bytesToSend)
-                length = struct.pack('!i', bytesLen)
-                self._aytReplySocket.send(length)
-                self._aytReplySocket.sendall(jsonDictStr.encode())
-
-                break
-
-            except OSError as error:
-                self._uio.errorException()
-                self._aytReplySocket.close()
-                self._aytReplySocket = None
-                self._connectToServer()
-                retryCount = retryCount + 1
-
-    def _listener(self):
-        """@brief Listen for are you there messages (UDP broadcast) from the android app.
-           @return The message received."""
-        self._uio.info("Listening on UDP port %d" % (AYTListener.UDP_DEV_DISCOVERY_PORT))
-
-        try:
-            while True:
-                #Inside loop so we re read config if changed by another instance using --config option.
-                jsonDict = self._deviceConfig.getConfigDict()
-
-                #Wait for RX data
-                rxData, addressPort = self._sock.recvfrom(AYTListener.UDP_RX_BUFFER_SIZE)
-
-                try:
-                    rxDict = json.loads(rxData)
-                    if AYTListener.AYT_KEY in rxDict:
-                        aytString = rxDict[AYTListener.AYT_KEY]
-                        #IF the AYT message matches the one we expect
-                        if jsonDict[DeviceConfig.AYT_MSG] == aytString:
-                            self._lastAYTMsgTime = time()
-                            #The AYT message from the android app contains the TCP port number
-                            #of the server to connect to. Check that the message contains the port number.
-                            if AYTListener.TCP_PORT_KEY in rxDict:
-                                serverTCPPort = rxDict[AYTListener.TCP_PORT_KEY]
-                                # Get the name of the interface on which we received the rxData
-                                self._rxIFName = self._netIF.getIFName(addressPort[0])
-                                self._connectToServer(addressPort[0], serverTCPPort)
-                                self._sendAYTReply()
-
-                        elif self._options.debug:
-                            self._uio.error("AYT mismatch:")
-                            self._uio.info("Expected: {}".format(jsonDict[DeviceConfig.AYT_MSG]) )
-                            self._uio.info("Found:    {}".format(aytString) )
-
-                except:
-                    pass
-
-        except:
-            self._uio.errorException()
-            self._uio.info("Shutdown the AYT message listener.")
-
-    def run(self):
-        """@brief A blocking method that listens for AYT messages and sends response back to
-                  a TCP server on the src address (android app on phone/tablet)."""
-
-        #Start the thread reading the RXP from the LB2120 4G router
+        dictToStore = {}
+        dictToStore["TIMESTAMP"]=lb2120Stats.sampleTime
+        dictToStore["DOWNMBPS"]=lb2120Stats.downMbps
+        dictToStore["UPMBPS"]=lb2120Stats.upMbps
+        dictToStore["TEMPC"]=lb2120Stats.tempC
+        dictToStore["TEMPCRITICAL"]=lb2120Stats.tempCrticial
+                    
+        self._dataBaseIF.insertRow(dictToStore, UsageLogger.TABLE_NAME, self._tableSchema)
+        self._addedCount=self._addedCount + 1
+        self._uio.info("{} TABLE: Added count: {}".format(UsageLogger.TABLE_NAME, self._addedCount) )
+            
+    def run(self, pollPeriodSeconds=1, errPauseSeconds=5):
+        """@brief A blocking method that reads the internet usage from the LB2120 device
+                  and stores the data in a sqlite database."""
+        self._lb2120 = LB2120(self._uio, self._options, self._queue)
+        #Start the thread reading the internet usage from the LB2120 4G router
         self._lb2120.start()
 
-        self._netIF = NetIF()
-
-        # Open UDP socket to be used for discovering devices
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        self._sock.bind(('', AYTListener.UDP_DEV_DISCOVERY_PORT))
-
-        self.initAYTTime()
-
-        try:
-
+        #Check we can connect to the database
+        self._connectToDBS()
+        try:                                        
             while True:
 
-                self._listener()
+                try:
+        
+                    lb2120Stats = self._queue.get(block=True)
 
-                sleep(5)
+                    self._uio.info("DOWN:          {:.3f} Mbps".format(lb2120Stats.downMbps))
+                    self._uio.info("UP:            {:.3f} Mbps".format(lb2120Stats.upMbps))
+                    self._uio.info("TEMP:          {:.1f} C".format(lb2120Stats.tempC))
+                    self._uio.info("TEMP CRITICAL: {}".format(lb2120Stats.tempCrticial))
+                    self._uio.info("SAMPLE TIME:   {}".format(lb2120Stats.sampleTime))
+                
+                    self._updateDatabase(lb2120Stats)
+
+                except Exception as ex:
+                    self._shutdownDBSConnection()
+                    self._lb2120.shutdown()
+                    self._lb2120 = LB2120(self._uio, self._options, self._queue)
+                    self._lb2120.start()
+                    self._connectToDBS()
+                    self._uio.error(str(ex))
+                    if self._options.debug:
+                        raise
+                    sleep(errPauseSeconds)
 
         finally:
             self.shutDown()
-
+                
     def shutDown(self):
-        """@brief Shutdown the network connection if connected."""
-        if self._sock:
-            self._sock.close()
+        """@brief Shutdown the db connection if connected."""
+        self._shutdownDBSConnection()
+        
+    def _getSQLCmd(sel, start, stop, listStride, tableName):
+        """@brief Get the SQL CMD to return a number of records accross the 
+                  required time period.
+           @param start The start date/time
+           @param stop The stop date/time
+           @stride The stride (every nth record) to read from the stored data. 1 = retrieve every record."""
 
-    def getSecsSinceAYTMsg(self):
-        """@brief Get the number of seconds since we last received an Are You There Message.
-           @return The number of seconds since the last AYT messag."""
-        seconds = time()-self._lastAYTMsgTime
-        return seconds
+        fieldList = "TIMESTAMP, DOWNMBPS, UPMBPS, TEMPC"
+        if listStride < 2:
+            sqlCmd = "SELECT * FROM `{}` WHERE TIMESTAMP >= \'{}\' and TIMESTAMP < \'{}\';".format(tableName, start, stop)
 
-    def initAYTTime(self):
-        """@brief Init the AYT message received time to now."""
-        self._lastAYTMsgTime=time()
-
-class DeviceConfig(object):
-    """@brief Responsible for managing the configuration used by the ydev application."""
-
-    UNIT_NAME                           = "UNIT_NAME"
-    AYT_MSG                             = "AYT_MSG"
-
-    DEFAULT_CONFIG = {
-        UNIT_NAME:    "",
-        AYT_MSG:      "GET_LB2120_STATUS",
-    }
-
-    def __init__(self, uio, configFile):
-        """@brief Constructor.
-           @param uio UIO instance.
-           @param configFile Config file instance."""
-        self._uio     = uio
-
-        self._configManager = ConfigManager(self._uio, configFile, DeviceConfig.DEFAULT_CONFIG)
-        self._configManager.load()
-
-    def configure(self):
-        """@brief configure the required parameters for normal operation."""
-        configOK = True
-        invalidInitialCharList = ('+','#','/')
-        while True:
-            self._configManager.inputStr(DeviceConfig.UNIT_NAME, "Enter the name of 4G modem", False)
-            unitName = self._configManager.getAttr(DeviceConfig.UNIT_NAME)
-            if len(unitName) > 0 and unitName[0] in invalidInitialCharList:
-                self._uio.warn("The name of a device may not start with a '%s' character." % (unitName[0]) )
-            else:
-                break
-
-        self._configManager.inputStr(DeviceConfig.AYT_MSG, "The devices 'Are You There' message text (min 8, max 64 characters)", False)
-
-        if configOK:
-            self._configManager.store()
         else:
-            self._uio.error("Configuration aborted.")
+            sqlCmd = "SELECT *\r"
+            sqlCmd = sqlCmd+"FROM (\r"
+            sqlCmd = sqlCmd+"SELECT\r"
+            sqlCmd = sqlCmd+"@row := @row +1 AS rownum, %s\r" % (fieldList)
+            sqlCmd = sqlCmd+"FROM (\r"
+            sqlCmd = sqlCmd+"SELECT @row :=0) r, %s\r" % (tableName)
+            sqlCmd = sqlCmd+") ranked\r"
+            sqlCmd = sqlCmd+"WHERE rownum %%%d = 1 and TIMESTAMP >= \'%s\' and TIMESTAMP < \'%s\';" % (listStride, start, stop)
+            
+        return sqlCmd
+        
+    def _getDataSet(self):
+        """@brief Get a set of data from the database. Before calling this 
+                  _connectToDBS() must have been successfully called.
+           @return A tuple of records."""
+         
+        tableName = UsageLogger.TABLE_NAME
 
-    def show(self):
-        """@brief Show the current configuration parameters."""
-        attrList = self._configManager.getAttrList()
-        attrList.sort()
+        readDBConfig = ReadDBConfig(self._uio, ReadDBConfig.CFG_FILENAME)
+        if self._options.cplot or self._options.total:
+            readDBConfig.configure()
 
-        maxAttLen=0
-        for attr in attrList:
-            if len(attr) > maxAttLen:
-                maxAttLen=len(attr)
+        start = datetime.datetime.strptime( readDBConfig.getAttr(ReadDBConfig.START_TIMESTAMP), "%Y/%b/%d %H:%M:%S" )
+        stop = start +  datetime.timedelta(days=readDBConfig.getAttr(ReadDBConfig.DAYS))
+        sql = self._getSQLCmd(start, stop, readDBConfig.getAttr(ReadDBConfig.STRIDE), tableName)
+        recordTuple = self._dataBaseIF.executeSQL(sql)
+        self._uio.info("Read {} records".format( len(recordTuple) ))
 
-        for attr in attrList:
-            padding = " "*(maxAttLen-len(attr))
-            self._uio.info("%s%s = %s" % (attr, padding, self._configManager.getAttr(attr)) )
+#        for record in recordTuple:
+#            self._uio.info( str(record) )
+#            self._uio.info( str(record["TIMESTAMP"]) )
+#            self._uio.info( str(record["DOWNMBPS"]) )
+#            self._uio.info( str(record["UPMBPS"]) )
+#            self._uio.info( str(record["TEMPC"]) )
+            
+        return recordTuple
 
-    def loadConfigQuiet(self):
-        """@brief Load the config without displaying a message to the user."""
-        self._configManager.load(showLoadedMsg=False)
+    def _plot(self, dataSet):
+        """@brief Save data to a html file and deploy if required.
+           @return dataSet The data to be plotted.
+           @return None"""
+        startTime = time()
 
-    def getAttr(self, key):
-        """@brief Get an attribute value.
-           @param key The key for the value we're after."""
+        fig = make_subplots(rows=1, cols=2, subplot_titles=("Throughput", "LB2120 Temperature"))
 
-        #If the config file has been modified then read the config to get the updated state.
-        if self._configManager.isModified():
-            self._configManager.load(showLoadedMsg=False)
-            self._configManager.updateModifiedTime()
+        xVals = [row["TIMESTAMP"] for row in dataSet ]
+        yVals = [row["DOWNMBPS"] for row in dataSet ]
+        fig.add_trace(
+            go.Scatter(x=xVals, y=yVals, name="Down"),
+            row=1, col=1
+        )
 
-        return self._configManager.getAttr(key)
+        yVals = [row["UPMBPS"] for row in dataSet ]
+        fig.add_trace(
+            go.Scatter(x=xVals, y=yVals, name="Up"),
+            row=1, col=1
+        )
 
-    def getConfigDict(self):
-        return self._configManager._configDict
+        yVals = [row["TEMPC"] for row in dataSet ]
+        fig.add_trace(
+            go.Scatter(x=xVals, y=yVals, name="Temp"),
+            row=1, col=2
+        )
+        fig.update_layout(title_text="4G Broadband")
+        fig.show()
+
+    def plot(self):
+        """@brief plot data stored in the database."""
+        
+        try:
+            self._connectToDBS()
+            dataSet = self._getDataSet()
+
+            self._plot(dataSet)
+            
+        finally:
+            self.shutDown()
+
+    def _showTotals(self, dataSet):
+        """@brief Calulate the total data transferred."""
+        startTime = None
+        stopTime = None
+        totalDownMbps = 0
+        totalUpMbps = 0
+
+        startTime = dataSet[0]["TIMESTAMP"]
+        stopTime = dataSet[-1]["TIMESTAMP"]
+        for row in dataSet:
+            totalDownMbps=totalDownMbps+row["DOWNMBPS"]
+            totalUpMbps=totalUpMbps+row["UPMBPS"]
+        timeDelta = stopTime - startTime
+        expectedMonthlyUsage = -1
+        if timeDelta.days > 0:
+            expectedMonthlyUsage = 31 / timeDelta.days * float(totalDownMbps + totalUpMbps) / 1E3
+
+        self._uio.info("Data usage between "+str(startTime)+" and "+str(stopTime)+"")
+        self._uio.info("Days:                    {} ".format(timeDelta.days) )
+        self._uio.info("Download:                {:.2f} Gbps".format( float(totalDownMbps)/1E3 ))
+        self._uio.info("Upload:                  {:.2f} Gbps".format( float(totalUpMbps)/1E3 ))
+        self._uio.info("Total:                   {:.2f} Gbps".format( float(totalDownMbps+totalUpMbps)/1E3 ))
+        if expectedMonthlyUsage > -1:
+            self._uio.info("Expected monthly usage:  {:.2f}".format(expectedMonthlyUsage))
+
+    def total(self):
+        """@brief Caclulate the total data over a period of time."""
+
+        try:
+            self._connectToDBS()
+            dataSet = self._getDataSet()
+            self.shutDown()
+            self._showTotals(dataSet)
+
+        finally:
+            self.shutDown()
 
 #Very simple cmd line template using optparse
 def main():
     uio = UIO()
 
     opts=OptionParser(version="1.0",\
-                      description="Read (HTML scrape) the receive power level from a Netgear LB2120 4G modem and send "\
-                            "messages including the 4G radio receive power to the Android Aligner App. "\
-                            "This program Responsible for responding to AYT messages from the Android Aligner App running "\
-                            "on a phone or tablet to send the receive power level of a Netgear LB2120 4G modem back to "\
-                            "the Android Aligner App. "\
-                            "The Android Aligner App then displays the receive power and outputs a tone that increases "\
-                            "in frequency as the receive power increases. "\
-                            "You can define the {} environmental variable "\
-                            "defining the Netgear LB2120 password to use this program. If not define then the user is\n"
-                            "prompted for the LB2120 password on startup.".format(LB2120.PASSWORD_ENV_VAR), formatter=IndentedHelpFormatter())
-    opts.add_option("--address",            help="The address of the Netgear LB2120 4G modem (default={}).".format(LB2120.DEFAULT_ADDRESS), default=LB2120.DEFAULT_ADDRESS)
-    opts.add_option("--config",             help="Configure persistent configuration options.", action="store_true", default=False)
-    opts.add_option("--debug",              help="Enable debugging.", action="store_true", default=False)
+                      description="Read (HTML scrape) the internet usage from a Netgear LB2120 4G modem and record "\
+                            "the results in an sqlite database.")
+    opts.add_option("--address",  help="The address of the Netgear LB2120 4G modem (default={}).".format(LB2120.DEFAULT_ADDRESS), default=LB2120.DEFAULT_ADDRESS)
+    opts.add_option("--psec",     help="The poll period in seconds (default={}).".format(LB2120.POLL_DELAY_SECONDS), type="int", default=LB2120.POLL_DELAY_SECONDS)
+    opts.add_option("--config",   help="Configure the database config.", action="store_true", default=False)
+    opts.add_option("--plot",     help="Plot data stored previously in the database. If this option is not used then data is collected and stored in the database.", action="store_true", default=False)
+    opts.add_option("--cplot",    help="Configure and plot data stored previously in the database. If this option is not used then data is collected and stored in the database.", action="store_true", default=False)
+    opts.add_option("--total",    help="Calculate the total data over a period of time.", action="store_true", default=False)
+    opts.add_option("--debug",    help="Enable debugging.", action="store_true", default=False)
 
     try:
         (options, args) = opts.parse_args()
         uio.enableDebug(options.debug)
 
-        deviceConfig = DeviceConfig(uio, "aligner_cap.cfg")
+        dbClientConfig = DBClientConfig(uio, DBClientConfig.CFG_FILENAME)
+   
         if options.config:
-            deviceConfig.configure()
+            dbClientConfig.configure()
+            
+        else:
+            usageLogger = UsageLogger(uio, options, dbClientConfig)
 
-        aytListener = AYTListener(uio, options, deviceConfig)
-        aytListener.run()
+            if options.total:
+                usageLogger.total()
+
+            elif options.plot or options.cplot:
+                usageLogger.plot()
+            else:
+                usageLogger.run()
 
     #If the program throws a system exit exception
     except SystemExit:

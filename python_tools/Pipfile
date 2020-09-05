@@ -10,6 +10,9 @@ webbot = "*"
 cryptography = "*"
 beautifulsoup4 = "*"
 mysqlclient = "*"
+paramiko = "*"
+plotly = "*"
+pandas = "*"
 
 [requires]
 python_version = "3.8"
