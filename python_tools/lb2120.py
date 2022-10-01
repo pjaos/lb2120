@@ -146,7 +146,6 @@ class LB2120(Thread):
         web.go_to('http://{}/index.html'.format(self._options.address))
         web.click(id='session_password')
         web.type(self._password)
-        #web.type('QtV6Dq4s')
         web.click('Sign In')
         web.click(id='session_password')
         startTime = time()

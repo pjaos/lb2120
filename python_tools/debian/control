@@ -5,4 +5,4 @@ Architecture: all
 Essential: no
 Maintainer: Paul Austen <pausten.os@gmail.com>
 Description: Tools for use with a Netear LB2120 4G router.
-Version: 1.1
+Version: 1.2
