@@ -13,6 +13,7 @@ mysqlclient = "*"
 paramiko = "*"
 plotly = "*"
 pandas = "*"
+p3lib = "*"
 
 [requires]
 python_version = "3.8"

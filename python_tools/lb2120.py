@@ -14,13 +14,13 @@ from    optparse import OptionParser
 from    webbot import Browser
 from    threading import Thread
 
-from    open_source_libs.p3lib.pconfig import ConfigManager
-from    open_source_libs.p3lib.database_if import DBConfig, DatabaseIF
-from    open_source_libs.p3lib.uio import UIO
+from    p3lib.pconfig import ConfigManager
+from    p3lib.database_if import DBConfig, DatabaseIF
+from    p3lib.uio import UIO
 
 class DBClientConfig(ConfigManager):
     """@brief Responsible for managing the database configuration."""
-    
+
     CFG_FILENAME            = "4g_usage_db_config.cfg"
 
     DB_HOST                 = "DB_HOST"
@@ -69,10 +69,10 @@ class DBClientConfig(ConfigManager):
         self._uio.info("Table schema string OK")
 
         self.store()
-        
+
 class ReadDBConfig(ConfigManager):
     """@brief Responsible for managing the configuration used when reading values from the database."""
-    
+
     CFG_FILENAME            = "read_4g_usage.cfg"
 
     START_TIMESTAMP         = "START_TIMESTAMP"
@@ -99,7 +99,7 @@ class ReadDBConfig(ConfigManager):
         self.inputStr(ReadDBConfig.START_TIMESTAMP, "Enter the start date and time in the format 2020/aug/10 15:30:15", False)
 
         self.inputDecInt(ReadDBConfig.DAYS, "Enter the number days data to read", False)
-        
+
         self.inputDecInt(ReadDBConfig.STRIDE, "Every n'th record to read (1 = every record, 2 = every other record, etc)")
 
         self.store()
@@ -112,7 +112,7 @@ class LB2120Stats(object):
         self.upMbps       = None
         self.tempC        = None
         self.tempCrticial = None
-        
+
 class LB2120(Thread):
     """@brief Responsibile for connecting to the Netgear LB2120 4G modem and
               reading stats from it.
@@ -163,16 +163,16 @@ class LB2120(Thread):
                 #Remove html text from the response
                 jsonContent=content.replace("<html xmlns=\"http://www.w3.org/1999/xhtml\"><head></head><body><pre style=\"word-wrap: break-word; white-space: pre-wrap;\">", "")
                 jsonContent=jsonContent.replace("</pre></body></html>", "")
-                
+
                 #Convert json text to a dict
                 data = json.loads(jsonContent)
-                            
+
                 #Grab the values associated with throughput
                 dataRX = int(data['wwan']['dataTransferredRx'])
                 dataTX = int(data['wwan']['dataTransferredTx'])
                 tempC  = float(data['general']['devTemperature'])
                 devTempCritical = data['power']['deviceTempCritical']
-                
+
                 if lastDataRX != -1:
                     if dataRX < lastDataRX:
                         print("<<<<<<<<<< dataRX: {} < {}".format(dataRX, lastDataRX))
@@ -181,42 +181,42 @@ class LB2120(Thread):
 
                     deltaDataRX = dataRX - lastDataRX
                     deltaDataTX = dataTX - lastDataTX
-                    
+
                     downLoadBps = (deltaDataRX/elapsedTime) * 8
                     upLoadBps = (deltaDataTX/elapsedTime) * 8
                     downLoadMBps = float(downLoadBps)/1E6
                     upLoadMBps   = float(upLoadBps/1E6)
-                    
+
                     lb2120Stats = LB2120Stats()
                     lb2120Stats.downMbps = downLoadMBps
                     lb2120Stats.upMbps = upLoadMBps
                     lb2120Stats.tempC = tempC
                     lb2120Stats.tempCrticial = devTempCritical
                     lb2120Stats.sampleTime = datetime.datetime.now()
-                    
+
                     self._queue.put(lb2120Stats)
-                    
+
                 #Save the last results for use next time around
                 lastDataRX = dataRX
                 lastDataTX = dataTX
-            
+
             except:
                 lines = traceback.format_exc().split('\n')
                 for l in lines:
                     self._uio.error(l)
-            
+
             sleep(self._options.psec)
-            
+
     def shutdown(self):
         """@brief Stop the thread running"""
         self.running = False
-    
+
 class UsageLogger(object):
     """@brief Responsible reading and recording the usage of the 4G internet connection."""
-    
+
     TIMESTAMP               = "TIMESTAMP"
     TABLE_NAME              = "LB2120_STATS"
-    
+
     @staticmethod
     def GetTableSchema(tableSchemaString):
         """@brief Get the table schema
@@ -242,7 +242,7 @@ class UsageLogger(object):
 
         if not timestampFound:
             raise Exception("No {} table column defined.".format(UsageLogger.TIMESTAMP))
-            
+
     def __init__(self, uo, options, config):
         """@Constructor
             @param uo A UserOutput instance.
@@ -260,7 +260,7 @@ class UsageLogger(object):
         if self._dataBaseIF:
             self._dataBaseIF.disconnect()
             self._dataBaseIF = None
-            
+
     def _setupDBConfig(self):
         """@brief Setup the internal DB config"""
         self._dataBaseIF                    = None
@@ -272,12 +272,12 @@ class UsageLogger(object):
         self._dbConfig.autoCreateTable      = True
         self._dbConfig.uio                  = self._uio
         self._dataBaseIF                    = DatabaseIF(self._dbConfig)
-        
+
     def getTableSchema(self):
         """@return the required MYSQL table schema"""
         tableSchemaString = self._config.getAttr(DBClientConfig.DB_TABLE_SCHEMA)
         return UsageLogger.GetTableSchema(tableSchemaString)
-        
+
     def _connectToDBS(self):
         """@brief connect to the database server."""
         self._shutdownDBSConnection()
@@ -289,11 +289,11 @@ class UsageLogger(object):
 
         self._tableSchema = self.getTableSchema()
         self._dataBaseIF.ensureTableExists(UsageLogger.TABLE_NAME, self._tableSchema, True)
-        
+
     def _updateDatabase(self, lb2120Stats):
         """@brief Update the database with the data received from the LB2120 web interface.
            @param lb2120Stats A LB2120Stats instance"""
-            
+
         if not self._dataBaseIF:
             self._connectToDBS()
 
@@ -303,11 +303,11 @@ class UsageLogger(object):
         dictToStore["UPMBPS"]=lb2120Stats.upMbps
         dictToStore["TEMPC"]=lb2120Stats.tempC
         dictToStore["TEMPCRITICAL"]=lb2120Stats.tempCrticial
-                    
+
         self._dataBaseIF.insertRow(dictToStore, UsageLogger.TABLE_NAME, self._tableSchema)
         self._addedCount=self._addedCount + 1
         self._uio.info("{} TABLE: Added count: {}".format(UsageLogger.TABLE_NAME, self._addedCount) )
-            
+
     def run(self, pollPeriodSeconds=1, errPauseSeconds=5):
         """@brief A blocking method that reads the internet usage from the LB2120 device
                   and stores the data in a sqlite database."""
@@ -317,11 +317,11 @@ class UsageLogger(object):
 
         #Check we can connect to the database
         self._connectToDBS()
-        try:                                        
+        try:
             while True:
 
                 try:
-        
+
                     lb2120Stats = self._queue.get(block=True)
 
                     self._uio.info("DOWN:          {:.3f} Mbps".format(lb2120Stats.downMbps))
@@ -329,7 +329,7 @@ class UsageLogger(object):
                     self._uio.info("TEMP:          {:.1f} C".format(lb2120Stats.tempC))
                     self._uio.info("TEMP CRITICAL: {}".format(lb2120Stats.tempCrticial))
                     self._uio.info("SAMPLE TIME:   {}".format(lb2120Stats.sampleTime))
-                
+
                     self._updateDatabase(lb2120Stats)
 
                 except Exception as ex:
@@ -345,13 +345,13 @@ class UsageLogger(object):
 
         finally:
             self.shutDown()
-                
+
     def shutDown(self):
         """@brief Shutdown the db connection if connected."""
         self._shutdownDBSConnection()
-        
+
     def _getSQLCmd(sel, start, stop, listStride, tableName):
-        """@brief Get the SQL CMD to return a number of records accross the 
+        """@brief Get the SQL CMD to return a number of records accross the
                   required time period.
            @param start The start date/time
            @param stop The stop date/time
@@ -370,14 +370,14 @@ class UsageLogger(object):
             sqlCmd = sqlCmd+"SELECT @row :=0) r, %s\r" % (tableName)
             sqlCmd = sqlCmd+") ranked\r"
             sqlCmd = sqlCmd+"WHERE rownum %%%d = 1 and TIMESTAMP >= \'%s\' and TIMESTAMP < \'%s\';" % (listStride, start, stop)
-            
+
         return sqlCmd
-        
+
     def _getDataSet(self):
-        """@brief Get a set of data from the database. Before calling this 
+        """@brief Get a set of data from the database. Before calling this
                   _connectToDBS() must have been successfully called.
            @return A tuple of records."""
-         
+
         tableName = UsageLogger.TABLE_NAME
 
         readDBConfig = ReadDBConfig(self._uio, ReadDBConfig.CFG_FILENAME)
@@ -396,7 +396,7 @@ class UsageLogger(object):
 #            self._uio.info( str(record["DOWNMBPS"]) )
 #            self._uio.info( str(record["UPMBPS"]) )
 #            self._uio.info( str(record["TEMPC"]) )
-            
+
         return recordTuple
 
     def _plot(self, dataSet):
@@ -430,13 +430,13 @@ class UsageLogger(object):
 
     def plot(self):
         """@brief plot data stored in the database."""
-        
+
         try:
             self._connectToDBS()
             dataSet = self._getDataSet()
 
             self._plot(dataSet)
-            
+
         finally:
             self.shutDown()
 
@@ -497,10 +497,10 @@ def main():
         uio.enableDebug(options.debug)
 
         dbClientConfig = DBClientConfig(uio, DBClientConfig.CFG_FILENAME)
-   
+
         if options.config:
             dbClientConfig.configure()
-            
+
         else:
             usageLogger = UsageLogger(uio, options, dbClientConfig)
 
